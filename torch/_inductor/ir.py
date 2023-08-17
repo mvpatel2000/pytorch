@@ -42,6 +42,8 @@ from torch._prims_common import (
 )
 from torch.fx.operator_schemas import get_signature_for_torch_op
 from torch.utils._sympy.functions import CleanDiv, FloorDiv, ModularIndexing
+import torch._export.serde.schema as export_schema
+from torch._export.serde.serialize import GraphModuleSerializer
 
 from . import config, dependencies
 from .codegen.common import index_prevent_reordering
@@ -3289,6 +3291,12 @@ class DynamicScalar(IRNode):
 
 
 @dataclasses.dataclass
+class ExternKernelNode:
+    name: str
+    node: export_schema.Node
+
+
+@dataclasses.dataclass
 class FallbackKernel(ExternKernelAlloc):
     def __init__(
         self,
@@ -3306,6 +3314,8 @@ class FallbackKernel(ExternKernelAlloc):
             tuple(nontensor_args),
         )
         self.use_cpp_op_schema = False
+
+        self.op_overload = kernel
 
         op_overload_packet = (
             kernel._overloadpacket
@@ -3414,8 +3424,36 @@ class FallbackKernel(ExternKernelAlloc):
             return devices[0]
         return None
 
+    def export_extern_kernel_node(self):
+        args, kwargs = self.unflatten_args(self.inputs, self.constant_args)
+        # TODO: need addtional checking for kwargs, see self.codegen_args()
+
+        serializer = GraphModuleSerializer(None, None, None)
+        named_arguments = serializer.serialize_inputs(self.op_overload, args, kwargs)
+
+        # TODO: only single output is supported
+        output_arguments = [
+            export_schema.Argument.create(
+                as_tensor=export_schema.TensorArgument(name=self.get_name()))
+        ]
+
+        node = ExternKernelNode(
+            name = self.get_name(),
+            node = export_schema.Node(
+                target = self.kernel,
+                inputs = named_arguments,
+                outputs = output_arguments,
+                metadata = {})
+        )
+
+        V.graph.extern_kernel_nodes.append(node)
+
+        return args, kwargs
+
     def codegen(self, wrapper):
         if self.use_cpp_op_schema:
+            exported_args, exported_kwargs = self.export_extern_kernel_node()
+
             args = [*self.codegen_args(), *self.codegen_kwargs()]
             wrapper.generate_extern_kernel_alloc_and_find_schema_if_needed(
                 self.get_name(),
@@ -3424,6 +3462,9 @@ class FallbackKernel(ExternKernelAlloc):
                 self.cpp_op_schema,
                 self.cpp_kernel_key,
                 self.cpp_kernel_overlad_name,
+                self.op_overload,
+                exported_args,
+                exported_kwargs,
             )
         else:
             super().codegen(wrapper)
