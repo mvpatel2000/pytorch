@@ -1,6 +1,8 @@
 # Owner(s): ["module: onnx"]
 from __future__ import annotations
 
+import collections
+
 import itertools
 import os
 import tempfile
@@ -35,6 +37,26 @@ except ImportError:
 except RuntimeError:
     HAS_TORCHVISION = False
 skip_if_no_torchvision = unittest.skipIf(not HAS_TORCHVISION, "no torchvision")
+
+
+# NOTE: This functions can captures all buffers and parameters from a model, which state_dict() cannot.
+# This is because state_dict() only captures parameters and buffers that are registered as
+# non-persistent. However, in large-scale exporter, we need to capture all tensors
+# that are used in the model.
+# TODO: Publish this function?
+def _extract_all_buffers_and_params(model: torch.nn.Module) -> collections.OrderedDict:
+    """Extract all buffers and parameters from a model.
+    Args:
+        model (torch.nn.Module): The model to extract buffers and parameters from.
+    Returns:
+        OrderedDict: An OrderedDict of the form {name: tensor}.
+    """
+    buffer_and_params = collections.OrderedDict()
+    for name, param in model.named_parameters():
+        buffer_and_params[name] = param
+    for name, buffer in model.named_buffers():
+        buffer_and_params[name] = buffer
+    return buffer_and_params
 
 
 def _parameterized_class_attrs_and_values():
@@ -658,7 +680,7 @@ class TestFxToOnnxWithOnnxRuntime(onnx_test_common._TestONNXRuntime):
         ) as tmp_folder:
             # Dump state_dict to a file to simulate how HuggingFace model is initialized.
             # The file will be loaded via .load_state_dict(...)
-            torch.save(model.state_dict(), tmp_file.name)
+            torch.save(_extract_all_buffers_and_params(model), tmp_file.name)
 
             ftm = fake_tensor.FakeTensorMode(
                 allow_non_fake_inputs=True, allow_fallback_kernels=False
@@ -672,7 +694,9 @@ class TestFxToOnnxWithOnnxRuntime(onnx_test_common._TestONNXRuntime):
             with ctx, ftm:
                 # Toy model with parameters and buffers as FakeTensor's.
                 fake_model = create_model()
-                fake_model.load_state_dict(torch.load(tmp_file.name))
+                # NOTE: Unlike `enable_fake_mode`, load_state_dict is required to
+                # be called before calling FXSymbolicTracer
+                fake_model.load_state_dict(torch.load(tmp_file.name), strict=False)
                 # Toy inputs as FakeTensor's.
                 fake_args = create_args()
                 # Export ONNX model without initializers while ctx.paths records
@@ -728,11 +752,13 @@ class TestFxToOnnxWithOnnxRuntime(onnx_test_common._TestONNXRuntime):
                 model(*args, **kwargs)
             )
             # ORT outputs.
+            # NOTE: This postprocess is caused by LiftParametersAndBuffersIntoArgsStep.
+            # LiftParametersAndBuffersIntoArgsStep should not be included in io_adapter,
+            # but given the way `generate_fx` is implemented, it is not possible to
+            # exclude it in tracer. fx_symbolic_tracer will be deprecated soon anyway.
+            number_of_inputs = len([arg for arg in args if arg is not None])
             args_not_none = export_output.adapt_torch_inputs_to_onnx(*args)
-
-            # Drop Parameters and buffers added by fx_serialization.save_model_with_external_data
-            args_not_none = args_not_none[: len(args) - len(kwargs)]
-
+            args_not_none = args_not_none[:number_of_inputs]
             ort_outputs = onnx_test_common.run_ort(
                 os.path.join(tmp_folder, onnx_model_location),
                 args_not_none,
@@ -781,27 +807,23 @@ class TestFxToOnnxWithOnnxRuntime(onnx_test_common._TestONNXRuntime):
             create_pytorch_only_extra_kwargs,
         )
 
-    @pytorch_test_common.xfail(
-        "[ONNXRuntimeError] : 1 : FAIL : Type Error: Data in initializer 'h_0_attn_bias' "
-        "has element type tensor(uint8) but usage of initializer in graph expects tensor(bool)"
-        "https://github.com/huggingface/transformers/issues/21013"
-    )
     @pytorch_test_common.skip_dynamic_fx_test(
         "FakeTensor exporting is not supported by dynamic axes."
     )
     def test_fx_symbolic_tracer_large_scale_exporter_with_tiny_gpt2(self):
-        model_name = "sshleifer/tiny-gpt2"
+        config = transformers.GPT2Config()
         device = "cpu"
+        batch, seq = 4, 256
 
         def create_model() -> nn.Module:
-            return transformers.AutoModel.from_pretrained(model_name).to(device).eval()
+            return transformers.GPT2Model(config).to(device).eval()
 
         def create_args():
-            tokenizer = transformers.AutoTokenizer.from_pretrained(model_name)
-            kwargs = tokenizer("Hello world!", return_tensors="pt")
-            input_ids = kwargs["input_ids"]
-            attention_mask = kwargs["attention_mask"]
-            return input_ids, None, attention_mask
+            input_ids = torch.randint(0, config.vocab_size, (batch, seq))
+            attention_mask = torch.ones(batch, seq, dtype=torch.bool)
+            position_ids = torch.arange(0, seq, dtype=torch.long)
+            position_ids = position_ids.unsqueeze(0).view(-1, seq)
+            return input_ids, None, attention_mask, None, position_ids
 
         def create_pytorch_only_extra_kwargs():
             return {"return_dict": False}
@@ -816,14 +838,11 @@ class TestFxToOnnxWithOnnxRuntime(onnx_test_common._TestONNXRuntime):
 
 def _parameterized_class_attrs_and_values_with_fake_options():
     input_values = []
-    input_values.extend(
-        itertools.product((True, False), (True, False), (True, False), (True, False))
-    )
+    input_values.extend(itertools.product((True, False), (True, False), (True, False)))
     return {
         "attrs": [
             "op_level_debug",
             "dynamic_shapes",
-            "load_checkpoint_during_init",
             "export_within_fake_mode",
         ],
         "input_values": input_values,
@@ -842,7 +861,6 @@ class TestFxToOnnxFakeTensorWithOnnxRuntime(onnx_test_common._TestONNXRuntime):
 
     op_level_debug: bool
     dynamic_shapes: bool
-    load_checkpoint_during_init: bool
     export_within_fake_mode: bool
 
     def setUp(self):
@@ -856,7 +874,6 @@ class TestFxToOnnxFakeTensorWithOnnxRuntime(onnx_test_common._TestONNXRuntime):
         create_model: Callable,
         create_args: Callable,
         create_kwargs: Callable,
-        load_checkpoint_during_init: bool,
         export_within_fake_mode: bool,
     ):
         """Test helper for FakeTensorMode-enabled exporter.
@@ -866,8 +883,6 @@ class TestFxToOnnxFakeTensorWithOnnxRuntime(onnx_test_common._TestONNXRuntime):
             create_model: A function that creates a model.
             create_args: A function that creates positional inputs for the model.
             create_kwargs: A function that creates keyword inputs for ther model.
-            load_checkpoint_during_init: Whether to load a checkpoint during model initialization.
-                (after or during model creation, but before exporting starts)
             export_within_fake_mode: Whether to call torch.onnx._dynamo_export within torch._subclasses.FakeTensorMode
 
         This test contains several steps.
@@ -890,15 +905,13 @@ class TestFxToOnnxFakeTensorWithOnnxRuntime(onnx_test_common._TestONNXRuntime):
         ) as tmp_checkpoint_file:
             # Dump state_dict to a file to simulate how HuggingFace model is initialized.
             # The file will be loaded via .load_state_dict(...)
-            state_dict = real_model.state_dict()
+            state_dict = _extract_all_buffers_and_params(real_model)
             torch.save(state_dict, tmp_checkpoint_file.name)
 
             with torch.onnx.enable_fake_mode() as fake_context:
                 fake_args = create_args()
                 fake_kwargs = create_kwargs()
                 fake_model = create_model()
-                if load_checkpoint_during_init:
-                    fake_model.load_state_dict(torch.load(tmp_checkpoint_file.name))
 
                 # Export the model with fake inputs and parameters
                 export_options = torch.onnx.ExportOptions(
@@ -973,38 +986,118 @@ class TestFxToOnnxFakeTensorWithOnnxRuntime(onnx_test_common._TestONNXRuntime):
             create_model,
             create_args,
             create_kwargs,
-            load_checkpoint_during_init=self.load_checkpoint_during_init,
             export_within_fake_mode=self.export_within_fake_mode,
         )
 
-    @pytorch_test_common.xfail(
-        "[ONNXRuntimeError] : 1 : FAIL : Type Error: Data in initializer 'h_0_attn_bias' "
-        "has element type tensor(uint8) but usage of initializer in graph expects tensor(bool)"
-        "https://github.com/huggingface/transformers/issues/21013"
-    )
-    def test_large_scale_exporter_with_tiny_gpt2(self):
-        model_name = "sshleifer/tiny-gpt2"
+    def test_large_scale_exporter_with_gpt2(self):
+        config = transformers.GPT2Config()
         device = "cpu"
+        batch, seq = 4, 256
 
         def create_model() -> nn.Module:
-            return transformers.AutoModel.from_pretrained(model_name).to(device).eval()
+            return transformers.GPT2Model(config).to(device).eval()
 
         def create_args():
-            tokenizer = transformers.AutoTokenizer.from_pretrained(model_name)
-            kwargs = tokenizer("Hello world!", return_tensors="pt")
-            input_ids = kwargs["input_ids"]
-            attention_mask = kwargs["attention_mask"]
-            return input_ids, None, attention_mask
+            input_ids = torch.randint(0, config.vocab_size, (batch, seq))
+            attention_mask = torch.ones(batch, seq, dtype=torch.bool)
+            position_ids = torch.arange(0, seq, dtype=torch.long)
+            position_ids = position_ids.unsqueeze(0).view(-1, seq)
+            return input_ids, None, attention_mask, None, position_ids
 
         def create_kwargs():
             return {"return_dict": False}
 
         self._test_fake_tensor_mode_exporter(
-            "tiny_gpt2",
+            "huggingface_gpt2",
             create_model,
             create_args,
             create_kwargs,
-            load_checkpoint_during_init=self.load_checkpoint_during_init,
+            export_within_fake_mode=self.export_within_fake_mode,
+        )
+
+    def test_large_scale_exporter_with_t5(self):
+        config = transformers.T5Config(
+            vocab_size=8096,
+            d_model=64,
+            d_kv=8,
+            d_ff=128,
+            num_layers=4,
+            num_decoder_layers=None,
+            num_heads=4,
+            relative_attention_num_buckets=8,
+            relative_attention_max_distance=64,
+        )
+        device = "cpu"
+        batch, seq = 4, 256
+
+        def create_model() -> nn.Module:
+            return transformers.T5Model(config).to(device).eval()
+
+        def create_args():
+            input_ids = torch.randint(0, config.vocab_size, (batch, seq))
+            attention_mask = torch.ones((batch, seq), dtype=torch.bool)
+            decoder_input_ids = torch.randint(0, config.vocab_size, (batch, seq))
+            return input_ids, attention_mask, decoder_input_ids
+
+        def create_kwargs():
+            return {"return_dict": False}
+
+        self._test_fake_tensor_mode_exporter(
+            "huggiinface_google_t5",
+            create_model,
+            create_args,
+            create_kwargs,
+            export_within_fake_mode=self.export_within_fake_mode,
+        )
+
+    def test_large_scale_exporter_with_whisper(self):
+        config = transformers.WhisperConfig(
+            vocab_size=8096,
+            num_mel_bins=40,
+            encoder_layers=2,
+            encoder_attention_heads=2,
+            decoder_layers=2,
+            decoder_attention_heads=2,
+            decoder_ffn_dim=384,
+            encoder_ffn_dim=384,
+            d_model=64,
+            decoder_start_token_id=8001,
+            pad_token_id=8000,
+            bos_token_id=8000,
+            eos_token_id=8000,
+            begin_suppress_tokens=[220, 8000],
+        )
+        feature_extractor = transformers.WhisperFeatureExtractor(feature_size=40)
+        device = "cpu"
+        batch = 4
+
+        def create_model() -> nn.Module:
+            return transformers.AutoModel.from_config(config).to(device).eval()
+
+        def create_args():
+            return ()
+
+        def create_kwargs():
+            input_features = torch.randn(
+                (
+                    batch,
+                    feature_extractor.feature_size,
+                    feature_extractor.nb_max_frames,
+                ),
+                dtype=torch.float32,
+            )
+            decoder_input_ids = torch.tensor([[1, 1]]) * config.decoder_start_token_id
+            return {
+                "input_features": input_features,
+                "decoder_input_ids": decoder_input_ids,
+                "return_dict": False,
+            }
+
+        self._test_fake_tensor_mode_exporter(
+            "huggiinface_google_t5",
+            create_model,
+            create_args,
+            create_kwargs,
             export_within_fake_mode=self.export_within_fake_mode,
         )
 
@@ -1041,7 +1134,6 @@ class TestFxToOnnxFakeTensorWithOnnxRuntime(onnx_test_common._TestONNXRuntime):
             create_model,
             create_args,
             create_kwargs,
-            load_checkpoint_during_init=self.load_checkpoint_during_init,
             export_within_fake_mode=self.export_within_fake_mode,
         )
 
@@ -1074,7 +1166,6 @@ class TestFxToOnnxFakeTensorWithOnnxRuntime(onnx_test_common._TestONNXRuntime):
             create_model,
             create_args,
             create_kwargs,
-            load_checkpoint_during_init=self.load_checkpoint_during_init,
             export_within_fake_mode=self.export_within_fake_mode,
         )
 

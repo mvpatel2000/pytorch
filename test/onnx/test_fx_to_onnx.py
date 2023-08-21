@@ -407,28 +407,7 @@ class TestFxToOnnx(pytorch_test_common.ExportTestCase):
                     fake_model, real_x, export_options=export_options
                 )
 
-    def test_fake_tensor_mode_huggingface_gpt2(self):
-        config = transformers.GPT2Config()
-        batch, seq = 4, 256
-
-        with torch.onnx.enable_fake_mode() as fake_context:
-            model = transformers.GPT2Model(config).eval()
-            input_ids = torch.randint(0, config.vocab_size, (batch, seq))
-            attention_mask = torch.ones(batch, seq, dtype=torch.bool)
-            position_ids = torch.arange(0, seq, dtype=torch.long)
-            position_ids = position_ids.unsqueeze(0).view(-1, seq)
-
-            export_options = torch.onnx.ExportOptions(fake_context=fake_context)
-            export_output = torch.onnx.dynamo_export(
-                model,
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                export_options=export_options,
-            )
-            onnx.checker.check_model(export_output.model_proto)
-            onnx.shape_inference.infer_shapes(export_output.model_proto)
-
+    # TODO: Unsupported constant tensor in fakemode blocks moving this test to runtime
     def test_fake_tensor_mode_huggingface_bigscience_bloom(self):
         config = transformers.BloomConfig()
         batch, seq = 4, 256
@@ -448,6 +427,7 @@ class TestFxToOnnx(pytorch_test_common.ExportTestCase):
             onnx.checker.check_model(export_output.model_proto)
             onnx.shape_inference.infer_shapes(export_output.model_proto)
 
+    # TODO: Unsupported constant tensor in fakemode blocks moving this test to runtime
     def test_fake_tensor_mode_huggingface_open_llama(self):
         config = transformers.OpenLlamaConfig()
         batch, seq = 4, 256
@@ -465,52 +445,6 @@ class TestFxToOnnx(pytorch_test_common.ExportTestCase):
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
-                export_options=export_options,
-            )
-            onnx.checker.check_model(export_output.model_proto)
-            onnx.shape_inference.infer_shapes(export_output.model_proto)
-
-    def test_fake_tensor_mode_huggingface_google_t5(self):
-        config = transformers.T5Config()
-        device = "cpu"
-        batch, seq = 4, 256
-        with torch.onnx.enable_fake_mode() as fake_context:
-            model = transformers.T5Model(config).to(device).eval()
-            input_ids = torch.randint(0, config.vocab_size, (batch, seq))
-            attention_mask = torch.ones((batch, seq), dtype=torch.bool)
-            decoder_input_ids = torch.randint(0, config.vocab_size, (batch, seq))
-            export_options = torch.onnx.ExportOptions(fake_context=fake_context)
-            export_output = torch.onnx.dynamo_export(
-                model,
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                decoder_input_ids=decoder_input_ids,
-                export_options=export_options,
-            )
-            onnx.checker.check_model(export_output.model_proto)
-            onnx.shape_inference.infer_shapes(export_output.model_proto)
-
-    def test_fake_tensor_mode_huggingface_openai_whisper(self):
-        config = transformers.WhisperConfig()
-        feature_extractor = transformers.WhisperFeatureExtractor()
-        device = "cpu"
-        batch = 4
-        with torch.onnx.enable_fake_mode() as fake_context:
-            input_features = torch.randn(
-                (
-                    batch,
-                    feature_extractor.feature_size,
-                    feature_extractor.nb_max_frames,
-                ),
-                dtype=torch.float32,
-            )
-            decoder_input_ids = torch.tensor([[1, 1]]) * config.decoder_start_token_id
-            model = transformers.AutoModel.from_config(config).to(device).eval()
-            export_options = torch.onnx.ExportOptions(fake_context=fake_context)
-            export_output = torch.onnx.dynamo_export(
-                model,
-                input_features,
-                decoder_input_ids=decoder_input_ids,
                 export_options=export_options,
             )
             onnx.checker.check_model(export_output.model_proto)
