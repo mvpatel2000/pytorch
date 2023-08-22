@@ -1,3 +1,4 @@
+import copy
 import dataclasses
 import inspect
 import re
@@ -56,6 +57,7 @@ from .passes.replace_view_ops_with_view_copy_ops_pass import (
 )
 from .wrappers import _wrap_submodules
 
+
 # Note - [On Export Dynamic Dimension UX]
 #
 # After a lot of discussion, we have settled on a dynamic marking API
@@ -94,20 +96,19 @@ def dynamic_dim(t: torch.Tensor, index: int):
     if not isinstance(t, torch.Tensor):
         raise UserError(
             UserErrorType.DYNAMIC_DIM,
-            f"Expected tensor as input to dynamic_dim but got {type(t)}"
+            f"Expected tensor as input to dynamic_dim but got {type(t)}",
         )
 
     if t.dim() < 1:
         raise UserError(
-            UserErrorType.DYNAMIC_DIM,
-            "Cannot mark 0-dimension tensors to be dynamic"
+            UserErrorType.DYNAMIC_DIM, "Cannot mark 0-dimension tensors to be dynamic"
         )
 
     if index >= t.dim():
         raise UserError(
             UserErrorType.DYNAMIC_DIM,
             f"Expected the dimension passed to dynamic_dim to be in the range [0:{t.dim()-1}]"
-            f" but got {index}, which is out of bounds for the given tensor."
+            f" but got {index}, which is out of bounds for the given tensor.",
         )
 
     return Constraint(
@@ -125,7 +126,9 @@ class ExportDynamoConfig:
     """
     Manage Export-specific configurations of Dynamo.
     """
+
     allow_rnn: bool = True
+
 
 DEFAULT_EXPORT_DYNAMO_CONFIG = ExportDynamoConfig()
 
@@ -202,8 +205,10 @@ def export(
     kwargs = kwargs or {}
 
     if not isinstance(args, tuple):
-        raise UserError(UserErrorType.INVALID_INPUT,
-                        f"Expecting `args` to be a tuple of example positional inputs, got {type(args)}")
+        raise UserError(
+            UserErrorType.INVALID_INPUT,
+            f"Expecting `args` to be a tuple of example positional inputs, got {type(args)}",
+        )
 
     with torch._dynamo.config.patch(dataclasses.asdict(DEFAULT_EXPORT_DYNAMO_CONFIG)):  # type: ignore[attr-defined]
         try:
@@ -219,7 +224,9 @@ def export(
             if isinstance(f, torch.fx.GraphModule) and _safe_to_skip(f):
                 gm_torch_level = f
             else:
-                with _wrap_submodules(f, preserve_module_call_signature, module_call_signatures):
+                with _wrap_submodules(
+                    f, preserve_module_call_signature, module_call_signatures
+                ):
                     gm_torch_level, _ = torch._dynamo.export(
                         f,
                         constraints=constraints,
@@ -230,11 +237,17 @@ def export(
                         **kwargs,
                     )
 
-            params_buffers: OrderedDict[str, Union[torch.Tensor, torch.nn.Parameter]] = OrderedDict()
-            for name, param in gm_torch_level.named_parameters(recurse=True, remove_duplicate=False):
+            params_buffers: OrderedDict[
+                str, Union[torch.Tensor, torch.nn.Parameter]
+            ] = OrderedDict()
+            for name, param in gm_torch_level.named_parameters(
+                recurse=True, remove_duplicate=False
+            ):
                 params_buffers[name] = param
 
-            for name, buffer in gm_torch_level.named_buffers(recurse=True, remove_duplicate=False):
+            for name, buffer in gm_torch_level.named_buffers(
+                recurse=True, remove_duplicate=False
+            ):
                 params_buffers[name] = buffer
 
             fake_inps: List[torch.Tensor] = []
@@ -266,7 +279,9 @@ def export(
 
             fake_args = pytree.tree_map_only(torch.Tensor, convert_to_fake, args)
             # TODO properly use the cached fake tensor
-            fake_kwargs = pytree.tree_map_only(torch.Tensor, fake_mode.from_tensor, kwargs)
+            fake_kwargs = pytree.tree_map_only(
+                torch.Tensor, fake_mode.from_tensor, kwargs
+            )
 
             # First, we want to pass through the graph to try populating
             # val field for getattr if there is anything missing.
@@ -277,7 +292,9 @@ def export(
                     attr = getattr(gm_torch_level, node.target)
                     # Checks if it is not a HigherOrderOp branch or a module
                     if not isinstance(attr, torch.nn.Module):
-                        node.meta["val"] = fake_mode.from_tensor(attr, static_shapes=True)
+                        node.meta["val"] = fake_mode.from_tensor(
+                            attr, static_shapes=True
+                        )
 
             # When aot_export lifts the params, we lose the nn_module_stack
             # and source_fn from the param nodes as they are treated as fresh inputs
@@ -289,10 +306,14 @@ def export(
                 if node.op == "call_module":
                     submodule = getattr(gm_torch_level, target)
                     if isinstance(submodule, torch.nn.Module):
-                        for name, _ in submodule.named_parameters(recurse=True, remove_duplicate=False):
+                        for name, _ in submodule.named_parameters(
+                            recurse=True, remove_duplicate=False
+                        ):
                             params_buffers_to_node_meta[target + "." + name] = meta
 
-                        for name, _ in submodule.named_buffers(recurse=True, remove_duplicate=False):
+                        for name, _ in submodule.named_buffers(
+                            recurse=True, remove_duplicate=False
+                        ):
                             params_buffers_to_node_meta[target + "." + name] = meta
 
                 if node.op == "get_attr":
@@ -302,12 +323,16 @@ def export(
 
                 # If the call_function uses param as input, we also need to capture the meta for it
                 # This is basically the same flow as torch.fx.traceback.preserve_meta()
-                if node.op == "call_function" and not isinstance(node.target, torch._ops.HigherOrderOperator):
+                if node.op == "call_function" and not isinstance(
+                    node.target, torch._ops.HigherOrderOperator
+                ):
                     for arg in node._input_nodes:
                         if arg.op == "get_attr":
                             for entry in torch.fx.proxy._COPY_META_FIELDS:
                                 if entry in meta:
-                                    params_buffers_to_node_meta[arg.target][entry] = meta[entry]
+                                    params_buffers_to_node_meta[arg.target][
+                                        entry
+                                    ] = meta[entry]
 
             # Fix the graph output signature to be tuple if scalar
             out_spec = orig_out_spec = gm_torch_level._out_spec
@@ -330,16 +355,25 @@ def export(
             # to follow the order in orig_args and correctly call gm_torch_level
             gm, graph_signature = aot_export_module(
                 gm_torch_level,
-                (*fake_args, *_reorder_kwargs_by_names(orig_args, fake_args, fake_kwargs).values()),
+                (
+                    *fake_args,
+                    *_reorder_kwargs_by_names(
+                        orig_args, fake_args, fake_kwargs
+                    ).values(),
+                ),
                 decompositions=DECOMP_TABLE,
-                trace_joint=False
+                trace_joint=False,
             )
 
-            export_backward_signature = ExportBackwardSignature(
-                gradients_to_parameters=graph_signature.backward_signature.gradients_to_parameters,
-                gradients_to_user_inputs=graph_signature.backward_signature.gradients_to_user_inputs,
-                loss_output=graph_signature.backward_signature.loss_output
-            ) if graph_signature.backward_signature is not None else None
+            export_backward_signature = (
+                ExportBackwardSignature(
+                    gradients_to_parameters=graph_signature.backward_signature.gradients_to_parameters,
+                    gradients_to_user_inputs=graph_signature.backward_signature.gradients_to_user_inputs,
+                    loss_output=graph_signature.backward_signature.loss_output,
+                )
+                if graph_signature.backward_signature is not None
+                else None
+            )
 
             export_graph_signature = ExportGraphSignature(
                 parameters=graph_signature.parameters,
@@ -349,7 +383,7 @@ def export(
                 inputs_to_parameters=graph_signature.inputs_to_parameters,
                 inputs_to_buffers=graph_signature.inputs_to_buffers,
                 buffers_to_mutate=graph_signature.buffers_to_mutate,
-                backward_signature=export_backward_signature
+                backward_signature=export_backward_signature,
             )
 
             # NOTE: aot_export adds symint metadata for placeholders with int values;
@@ -357,12 +391,12 @@ def export(
             # TODO: we should add runtime assertions for them
             for node in gm.graph.nodes:
                 if node.op == "placeholder" and "val" in node.meta:
-                    s = node.meta['val']
-                    if (
-                        isinstance(s, torch.SymInt) and
-                        isinstance(fake_mode.shape_env.var_to_sources[s.node.expr][0], ConstantSource)
+                    s = node.meta["val"]
+                    if isinstance(s, torch.SymInt) and isinstance(
+                        fake_mode.shape_env.var_to_sources[s.node.expr][0],
+                        ConstantSource,
                     ):
-                        node.meta['val'] = s.node.hint
+                        node.meta["val"] = s.node.hint
 
             # TODO unfortunately preserving graph-level metadata is not
             # working well with aot_export. So we manually copy it.
@@ -384,14 +418,20 @@ def export(
             for node in gm.graph.nodes:
                 if node.op == "placeholder":
                     if node.target in export_graph_signature.inputs_to_parameters:
-                        param_name = export_graph_signature.inputs_to_parameters[node.target]
+                        param_name = export_graph_signature.inputs_to_parameters[
+                            node.target
+                        ]
                         if param_name in params_buffers_to_node_meta:
                             for k, v in params_buffers_to_node_meta[param_name].items():
                                 node.meta[k] = v
                     if node.target in export_graph_signature.inputs_to_buffers:
-                        buffer_name = export_graph_signature.inputs_to_buffers[node.target]
+                        buffer_name = export_graph_signature.inputs_to_buffers[
+                            node.target
+                        ]
                         if buffer_name in params_buffers_to_node_meta:
-                            for k, v in params_buffers_to_node_meta[buffer_name].items():
+                            for k, v in params_buffers_to_node_meta[
+                                buffer_name
+                            ].items():
                                 node.meta[k] = v
 
                 node.meta["is_torch_exported"] = True
@@ -411,14 +451,21 @@ def export(
                 params_buffers,
                 range_constraints,
                 equality_constraints,
-                [ModuleCallEntry(fqn, sig) for fqn, sig in module_call_signatures.items()],
+                [
+                    ModuleCallEntry(fqn, sig)
+                    for fqn, sig in module_call_signatures.items()
+                ],
             )
 
             exported_program = exported_program.transform(
-                _AddRuntimeAssertionsForInlineConstraintsPass(range_constraints, equality_constraints)
+                _AddRuntimeAssertionsForInlineConstraintsPass(
+                    range_constraints, equality_constraints
+                )
             )
             if len(preserve_module_call_signature) > 0:
-                exported_program = exported_program.transform(CollectTracepointsPass(module_call_signatures))
+                exported_program = exported_program.transform(
+                    CollectTracepointsPass(module_call_signatures)
+                )
             return exported_program.transform(_ReplaceSymSizeOpPass())
 
         except (ConstraintViolationError, ValueRangeError) as e:
@@ -426,14 +473,18 @@ def export(
         except GuardOnDataDependentSymNode as e:
             raise UserError(
                 UserErrorType.ANTI_PATTERN,
-                f"Consider annotating your code using constrain_as_*(). {str(e)}")
+                f"Consider annotating your code using constrain_as_*(). {str(e)}",
+            )
 
-def _reorder_kwargs_by_names(arg_names: List[str], args: Tuple[Any], kwargs: Dict[str, Any]):
+
+def _reorder_kwargs_by_names(
+    arg_names: List[str], args: Tuple[Any], kwargs: Dict[str, Any]
+):
     assert len(arg_names) == len(args) + len(kwargs), (
         f"Total number of arg names is expected to be {len(arg_names)} "
         f"but got {len(args)} positional args, {len(kwargs)} kwargs."
     )
-    return OrderedDict({kw_name: kwargs[kw_name] for kw_name in arg_names[len(args):]})
+    return OrderedDict({kw_name: kwargs[kw_name] for kw_name in arg_names[len(args) :]})
 
 
 def aot_compile(
@@ -474,11 +525,46 @@ def aot_compile(
     # Reset the global value
     DECOMP_TABLE = core_aten_decompositions()
 
-    param_buffer_values = list(ep.state_dict.values())
     flat_example_inputs = fx_pytree.tree_flatten_spec(
         combine_args_kwargs(args, kwargs), ep.call_spec.in_spec  # type: ignore[arg-type]
     )
-    all_args = (*param_buffer_values, *flat_example_inputs)
 
-    so_path = torch._inductor.aot_compile(ep.graph_module, list(all_args), options)
-    return so_path, ep
+    unlifted_module = ep.module()
+    unlifted_module.graph.set_codegen(torch.fx.CodeGen())  # type: ignore[attr-defined]
+    unlifted_module.recompile()
+    options = (
+        {"ignore_aot_autograd": True}
+        if options is None
+        else {**options, "ignore_aot_autograd": True}
+    )
+    so_path = torch._inductor.aot_compile(unlifted_module, flat_example_inputs, options)  # type: ignore[arg-type]
+
+    user_inputs = []
+    user_outputs = []
+    for node in unlifted_module.graph.nodes:
+        if node.op == "placeholder":
+            user_inputs.append(node.name)
+        elif node.op == "output":
+            user_outputs = [arg.name for arg in node.args[0]]
+
+    unlifted_ep = ExportedProgram(
+        unlifted_module,
+        unlifted_module.graph,
+        ExportGraphSignature(
+            [],
+            [],
+            user_inputs,
+            user_outputs,
+            {},
+            {},
+            {},
+            None,
+        ),
+        call_spec=copy.deepcopy(ep.call_spec),
+        state_dict={},
+        range_constraints=copy.deepcopy(ep.range_constraints),
+        equality_constraints=copy.deepcopy(ep.equality_constraints),
+        module_call_graph=ep.module_call_graph,
+    )
+
+    return so_path, unlifted_ep

@@ -565,6 +565,9 @@ def fx_codegen_and_compile(
                         context.output_strides.append(None)
             compiled_fn = graph.compile_to_fn()
 
+            if _in_aot_compilation:
+                return compiled_fn
+
             if graph.disable_cudagraphs:
                 BoxedBool.disable(cudagraphs)
 
@@ -846,7 +849,7 @@ def compile_fx_aot(
     example_inputs_: List[torch.Tensor],
     inner_compile: Callable[..., Any] = compile_fx_inner,
     config_patches: Optional[Dict[str, Any]] = None,
-):
+) -> str:
     config_patches = (
         {"cpp_wrapper": True}
         if config_patches is None
@@ -913,10 +916,11 @@ def fw_compiler_freezing(
     ]
 
     # constant params will be real tensors, not fake
-    params_flat = torch._guards.TracingContext.get().params_flat
-    for i in range(len(params_flat)):
-        if i not in preserved_arg_indices:
-            params_flat[i] = None
+    if torch._guards.TracingContext.get():
+        params_flat = torch._guards.TracingContext.get().params_flat
+        for i in range(len(params_flat)):
+            if i not in preserved_arg_indices:
+                params_flat[i] = None
 
     with mock.patch.object(fake_mode, "allow_non_fake_inputs", True):
         optimized_function = inner_compile(
@@ -1139,6 +1143,10 @@ def compile_fx(
     tracing_context = (
         torch._guards.TracingContext.get() or torch._guards.TracingContext(fake_mode)
     )
+
+    if _in_aot_compilation and config.ignore_aot_autograd:
+        with V.set_fake_mode(fake_mode), compiled_autograd.disable():
+            return inference_compiler(model_, example_inputs_)
 
     with V.set_fake_mode(fake_mode), torch._guards.tracing(
         tracing_context
