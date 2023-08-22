@@ -1,6 +1,7 @@
 # Owner(s): ["module: dynamo"]
 import functools
 import unittest
+from contextlib import contextmanager
 from importlib import import_module
 
 import torch
@@ -8,19 +9,65 @@ import torch
 import torch._dynamo.test_case
 import torch._functorch.config
 import torch.utils.checkpoint
+from functorch.compile import min_cut_rematerialization_partition
 from torch._dynamo.backends.common import aot_autograd
 from torch._dynamo.testing import CompileCounterWithBackend
-from torch._higher_order_ops.wrap import tag_activation_checkpoint
+from torch._higher_order_ops.wrap import handle_activation_checkpoint
 from torch.testing._internal.inductor_utils import HAS_CUDA
-from torch.utils.checkpoint import checkpoint
-
+from torch.utils.checkpoint import checkpoint, selective_checkpointing_context_gen
 
 requires_cuda = functools.partial(unittest.skipIf, not HAS_CUDA, "requires cuda")
 
 
-def count_ops(gm, args, freq, op):
-    assert [node.target for node in gm.graph.nodes].count(op) == freq
+def count_ops(
+    gm, args, freq=None, freq_ge=None, op=None, freqs=None, freqs_ge=None, ops=None
+):
+    assert ((freq or freq_ge) and op) or ((freqs or freqs_ge) and ops)
+    if op:
+        ops = [op]
+    if freq:
+        freqs = [freq]
+    if freq_ge:
+        freqs_ge = [freq_ge]
+    if freqs:
+        for op, freq in zip(ops, freqs):
+            actual_count = [node.target for node in gm.graph.nodes].count(op)
+            assert (
+                actual_count == freq
+            ), f"In graph {gm}, expected {op} to have occurred {freq} times in the graph, but got {actual_count}."
+    else:
+        assert freqs_ge is not None
+        for op, freq_ge in zip(ops, freqs_ge):
+            actual_count = [node.target for node in gm.graph.nodes].count(op)
+            assert (
+                actual_count >= freq_ge
+            ), f"In graph {gm}, expected {op} to have occurred at least {freq_ge} times in the graph, but got {actual_count}."
     return gm
+
+
+@contextmanager
+def _functorch_partitioner_use_cse():
+    prev_value = torch._functorch.config.cse
+    torch._functorch.config.cse = True
+    try:
+        yield
+    finally:
+        torch._functorch.config.cse = prev_value
+
+
+class _InvalidContext:
+    def __init__(self):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        pass
+
+
+def _invalid_context_gen():
+    return _InvalidContext(), _InvalidContext()
 
 
 def find_first_node(gm, func):
@@ -38,6 +85,13 @@ def op_count(gm):
     return result
 
 
+def _get_custom_policy(no_recompute_list=None):
+    def _custom_policy(mode, func, *args, **kwargs):
+        return func in no_recompute_list
+
+    return _custom_policy
+
+
 class ActivationCheckpointingViaTagsTests(torch._dynamo.test_case.TestCase):
     def _validate(self, fn, backend, *args, skip_check=False, fullgraph=True):
         cloned_args = []
@@ -53,9 +107,17 @@ class ActivationCheckpointingViaTagsTests(torch._dynamo.test_case.TestCase):
         result.sum().backward()
 
         if not skip_check:
-            self.assertEqual(result, expected)
+            self.assertEqual(
+                result,
+                expected,
+                msg="Output mismatch between torch.compile and eager versions",
+            )
             for arg, cloned_arg in zip(args, cloned_args):
-                self.assertEqual(arg.grad, cloned_arg.grad)
+                self.assertEqual(
+                    arg.grad,
+                    cloned_arg.grad,
+                    msg="Gradient mismatch between torch.compile and eager versions",
+                )
 
     @requires_cuda()
     def test_tags_function(self):
@@ -324,7 +386,7 @@ class ActivationCheckpointingViaTagsTests(torch._dynamo.test_case.TestCase):
         self.assertEqual(cnt.frame_count, 1)
         self.assertEqual(len(cnt.graphs), 1)
 
-        wrap_node = find_first_node(cnt.graphs[0], tag_activation_checkpoint)
+        wrap_node = find_first_node(cnt.graphs[0], handle_activation_checkpoint)
         # one for checkpoint, and 3 for x, y, z
         self.assertEqual(len(wrap_node.args), 4)
 
@@ -358,8 +420,290 @@ class ActivationCheckpointingViaTagsTests(torch._dynamo.test_case.TestCase):
         self.assertEqual(result.shape, expected.shape)
         self.assertEqual(cnt.frame_count, 2)
         self.assertEqual(len(cnt.graphs), 2)
-        wrap_node = find_first_node(cnt.graphs[0], tag_activation_checkpoint)
+        wrap_node = find_first_node(cnt.graphs[0], handle_activation_checkpoint)
         self.assertEqual(len(wrap_node.args), 3)
+
+    def test_compile_selective_checkpoint_gemm_only(self):
+        def selective_checkpointing_context():
+            no_recompute_list = [
+                torch.ops.aten.mm.default,
+            ]
+            return selective_checkpointing_context_gen(
+                _get_custom_policy(no_recompute_list=no_recompute_list)
+            )
+
+        def gn(x, y):
+            return torch.sigmoid(torch.matmul(torch.matmul(x, y), y)) * y
+
+        def fn(x, y):
+            return torch.utils.checkpoint.checkpoint(
+                gn,
+                torch.sin(x),
+                y,
+                use_reentrant=False,
+                context_fn=selective_checkpointing_context,
+            )
+
+        x = torch.randn(4, 4, requires_grad=True)
+        y = torch.randn(4, 4, requires_grad=True)
+
+        fw_compiler = functools.partial(
+            count_ops,
+            freq=2,
+            op=torch.ops.aten.mm.default,
+        )
+        bw_compiler = functools.partial(
+            count_ops,
+            freq=4,
+            op=torch.ops.aten.mm.default,
+        )
+        with _functorch_partitioner_use_cse():
+            backend = aot_autograd(
+                fw_compiler=fw_compiler,
+                bw_compiler=bw_compiler,
+                partition_fn=min_cut_rematerialization_partition,
+            )
+            self._validate(fn, backend, x, y)
+
+    def test_compile_selective_checkpoint_custom_rule(self):
+        def _get_custom_policy(meta):
+            no_recompute_list = [
+                torch.ops.aten.mm.default,
+            ]
+
+            def _custom_policy(mode, func, *args, **kwargs):
+                mm_count_key = f"{mode}_mm_count"
+                if mm_count_key not in meta:
+                    meta[mm_count_key] = 0
+                if func == torch.ops.aten.mm.default:
+                    meta[mm_count_key] += 1
+                # Saves output of all compute ops, except second mm
+                # (i.e. we will hint the partitioner to recompute second mm in backward pass)
+                return func in no_recompute_list and not (
+                    func == torch.ops.aten.mm.default and meta[mm_count_key] == 2
+                )
+
+            return _custom_policy
+
+        def selective_checkpointing_context():
+            meta = {}
+            return selective_checkpointing_context_gen(_get_custom_policy(meta))
+
+        def gn(x, y):
+            return torch.sigmoid(
+                torch.sigmoid(torch.matmul(torch.matmul(x, y) * y, y) * y)
+            )
+
+        def fn(x, y):
+            return torch.utils.checkpoint.checkpoint(
+                gn,
+                torch.sin(x),
+                y,
+                use_reentrant=False,
+                context_fn=selective_checkpointing_context,
+            )
+
+        x = torch.randn(4, 4, requires_grad=True)
+        y = torch.randn(4, 4, requires_grad=True)
+
+        fw_compiler = functools.partial(
+            count_ops,
+            freq=2,
+            op=torch.ops.aten.mm.default,
+        )
+        bw_compiler = functools.partial(
+            count_ops,
+            # The second mm may or may not be recomputed
+            # (since it's decided by the partitioner),
+            # so we use "greater than or equal" here.
+            freqs_ge=[4],
+            ops=[torch.ops.aten.mm.default],
+        )
+        with _functorch_partitioner_use_cse():
+            backend = aot_autograd(
+                fw_compiler=fw_compiler,
+                bw_compiler=bw_compiler,
+                partition_fn=min_cut_rematerialization_partition,
+            )
+            self._validate(fn, backend, x, y)
+
+    def test_compile_selective_checkpoint_outplace_op(self):
+        def selective_checkpointing_context():
+            no_recompute_list = [
+                torch.ops.aten.mm.default,
+                torch.ops.aten.sigmoid.default,
+            ]
+            return selective_checkpointing_context_gen(
+                _get_custom_policy(no_recompute_list=no_recompute_list),
+            )
+
+        def gn(x, y):
+            return torch.sigmoid(torch.selu(torch.matmul(torch.matmul(x, y), y))).relu()
+
+        def fn(x, y):
+            return torch.utils.checkpoint.checkpoint(
+                gn,
+                torch.sin(x),
+                y,
+                use_reentrant=False,
+                context_fn=selective_checkpointing_context,
+            )
+
+        x = torch.randn(4, 4, requires_grad=True)
+        y = torch.randn(4, 4, requires_grad=True)
+
+        fw_compiler = functools.partial(
+            count_ops,
+            freqs=[2, 1],
+            ops=[torch.ops.aten.mm.default, torch.ops.aten.sigmoid.default],
+        )
+        bw_compiler = functools.partial(
+            count_ops,
+            freqs=[4, 0],
+            ops=[torch.ops.aten.mm.default, torch.ops.aten.sigmoid.default],
+        )
+        with _functorch_partitioner_use_cse():
+            backend = aot_autograd(
+                fw_compiler=fw_compiler,
+                bw_compiler=bw_compiler,
+                partition_fn=min_cut_rematerialization_partition,
+            )
+            self._validate(fn, backend, x, y)
+
+    # TODO(yf225): after Brian's mode reordering stack lands, we will enable this test
+    def DISABLED_test_compile_selective_checkpoint_inplace_op(self):
+        def selective_checkpointing_context():
+            no_recompute_list = [
+                torch.ops.aten.mm.default,
+                torch.ops.aten.sigmoid.default,
+            ]
+            return selective_checkpointing_context_gen(
+                _get_custom_policy(no_recompute_list=no_recompute_list)
+            )
+
+        def gn(x, y):
+            return torch.sigmoid(
+                torch.selu_(torch.matmul(torch.matmul(x, y), y))
+            ).relu_()
+
+        def fn(x, y):
+            return torch.utils.checkpoint.checkpoint(
+                gn,
+                torch.sin(x),
+                y,
+                use_reentrant=False,
+                context_fn=selective_checkpointing_context,
+            )
+
+        x = torch.randn(4, 4, requires_grad=True)
+        y = torch.randn(4, 4, requires_grad=True)
+
+        fw_compiler = functools.partial(
+            count_ops,
+            freqs=[2, 1],
+            ops=[torch.ops.aten.mm.default, torch.ops.aten.sigmoid.default],
+        )
+        bw_compiler = functools.partial(
+            count_ops,
+            freqs=[4, 0],
+            ops=[torch.ops.aten.mm.default, torch.ops.aten.sigmoid.default],
+        )
+        with _functorch_partitioner_use_cse():
+            backend = aot_autograd(
+                fw_compiler=fw_compiler,
+                bw_compiler=bw_compiler,
+                partition_fn=min_cut_rematerialization_partition,
+            )
+            with self.assertRaisesRegex(
+                AssertionError,
+                "In-place ops are not supported in selective checkpointing region under torch.compile",
+            ):
+                self._validate(fn, backend, x, y)
+
+    # TODO(yf225): after Brian's mode reordering stack lands, we will enable this test
+    def DISABLED_test_compile_selective_checkpoint_random_op(self):
+        def selective_checkpointing_context():
+            no_recompute_list = [
+                torch.ops.aten.mm.default,
+                torch.ops.aten.sigmoid.default,
+            ]
+            return selective_checkpointing_context_gen(
+                _get_custom_policy(no_recompute_list=no_recompute_list)
+            )
+
+        def gn(x, y):
+            return torch.sigmoid(torch.matmul(torch.matmul(x, y), y)).bernoulli()
+
+        def fn(x, y):
+            return torch.utils.checkpoint.checkpoint(
+                gn,
+                torch.sin(x),
+                y,
+                use_reentrant=False,
+                context_fn=selective_checkpointing_context,
+            )
+
+        x = torch.randn(4, 4, requires_grad=True)
+        y = torch.randn(4, 4, requires_grad=True)
+
+        fw_compiler = functools.partial(
+            count_ops,
+            freqs=[2, 1],
+            ops=[torch.ops.aten.mm.default, torch.ops.aten.sigmoid.default],
+        )
+        bw_compiler = functools.partial(
+            count_ops,
+            freqs=[4, 0],
+            ops=[torch.ops.aten.mm.default, torch.ops.aten.sigmoid.default],
+        )
+        with _functorch_partitioner_use_cse():
+            backend = aot_autograd(
+                fw_compiler=fw_compiler,
+                bw_compiler=bw_compiler,
+                partition_fn=min_cut_rematerialization_partition,
+            )
+            with self.assertRaisesRegex(
+                AssertionError,
+                "Random ops are not supported in selective checkpointing region under torch.compile",
+            ):
+                self._validate(fn, backend, x, y)
+
+    def test_compile_selective_checkpoint_invalid_context(self):
+        def gn(x, y):
+            return torch.sigmoid(torch.matmul(x, y)) * y
+
+        def fn(x, y):
+            return torch.utils.checkpoint.checkpoint(
+                gn,
+                torch.sin(x),
+                y,
+                use_reentrant=False,
+                context_fn=_invalid_context_gen,
+            )
+
+        x = torch.randn(4, 4, requires_grad=True)
+        y = torch.randn(4, 4, requires_grad=True)
+
+        fw_compiler = functools.partial(
+            count_ops,
+            freq=1,
+            op=torch.ops.aten.mm.default,
+        )
+        bw_compiler = functools.partial(
+            count_ops,
+            freqs_ge=[2],
+            ops=[torch.ops.aten.mm.default],
+        )
+        with _functorch_partitioner_use_cse():
+            backend = aot_autograd(
+                fw_compiler=fw_compiler,
+                bw_compiler=bw_compiler,
+                partition_fn=min_cut_rematerialization_partition,
+            )
+            with self.assertRaisesRegex(
+                Exception, "must generate a tuple of two `TorchDispatchMode`s"
+            ):
+                self._validate(fn, backend, x, y)
 
 
 if __name__ == "__main__":

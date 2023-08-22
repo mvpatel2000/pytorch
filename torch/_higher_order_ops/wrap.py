@@ -1,9 +1,13 @@
-from torch._ops import HigherOrderOperator
-from torch.utils.checkpoint import checkpoint
-from itertools import count
 import inspect
+import logging
 
-uid = count(1)
+import torch
+from torch._ops import HigherOrderOperator
+from torch.utils.checkpoint import checkpoint, uid
+
+log = logging.getLogger(__name__)
+
+
 
 # Used for testing the HigherOrderOperator mechanism
 class Wrap(HigherOrderOperator):
@@ -25,15 +29,20 @@ class Wrap(HigherOrderOperator):
 
 wrap = Wrap()
 
-class WrapActivationCheckpoint(HigherOrderOperator):
+class HandleActivationCheckpoint(HigherOrderOperator):
     """
-    This operator is used to wrap torch.utils.checkpoint. This avoids
+    This operator is supposed to be used only with torch.compile stack.
+    There are two modes in this operator:
+
+    Mode 1: WrapActivationCheckpoint
+    This mode is used for selective checkpointing + torch.compile.
+    Under this mode, we wrap torch.utils.checkpoint. This avoids
     TorchDynamo to look into saved tensor hooks and directly passes the control
     to AOT Autograd, which is ok with tracing saved tensor hooks. As a result of
     AOT tracing torch.utils.checkpoint code, we have a backward graph with
     recomputed forward nodes.
 
-    However, we might deprecate this operator soon. The difficulty arises in the
+    However, we might deprecate this mode soon. The difficulty arises in the
     functionalization of rng ops. Today, there are two different
     functionalization of rng ops - one at AOT autograd and other at Inductor.
     And they are difficult to map to each other. The rng states also complicate
@@ -41,29 +50,12 @@ class WrapActivationCheckpoint(HigherOrderOperator):
     currently inclined towards functionalization at Inductor level, which means
     that duplication/recomputation is done as a compiler pass in the
     partitioners. See TagActivationCheckpoint for more information.
-    """
-    def __init__(self):
-        super().__init__("wrap_activation_checkpoint")
 
-    def __call__(self, function, *args, **kwargs):
-        # use_reentrant is set to False because this op is going to be traced.
-        # And we ensure that AOT Autograd traces through the non reentrant
-        # version of checkpointing.
-        import torch.fx.traceback as fx_traceback
-        from torch.fx import Interpreter
-        kwargs["use_reentrant"] = False
-        kwargs["preserve_rng_state"] = False
-        # Using interpreter allows preservation of metadata through torch.compile stack.
-        with fx_traceback.preserve_node_meta():
-            return checkpoint(Interpreter(function).run, *args, **kwargs)
-
-wrap_activation_checkpoint = WrapActivationCheckpoint()
-
-class TagActivationCheckpoint(HigherOrderOperator):
-    """
-    This operator is supposed to be used only with torch.compile stack. This
-    accepts a Fx graph module which needs to be checkpointed. This operator adds
-    "recomputable" tag to the nodes of the Fx graph that should be recomputed.
+    Mode 2: TagActivationCheckpoint
+    This mode is used for full activation checkpointing + torch.compile.
+    Under this mode, the operator accepts a Fx graph module which needs to be checkpointed.
+    This operator adds "recomputable" tag to the nodes of the Fx graph that
+    should be recomputed.
 
     The goal is to avoid both Dynamo and AOT Autograd to trace through saved
     tensor hooks, and rather rely on the partitioners to actually duplicate the
@@ -74,7 +66,8 @@ class TagActivationCheckpoint(HigherOrderOperator):
     """
 
     def __init__(self):
-        super().__init__("tag_activation_checkpoint")
+        super().__init__("handle_activation_checkpoint")
+        self.context_fn = None
 
     @staticmethod
     def divide_kwargs(kwargs):
@@ -110,10 +103,6 @@ class TagActivationCheckpoint(HigherOrderOperator):
         return checkpoint_kwargs, gmod_kwargs
 
     def tag_nodes(self, gmod):
-        # TODO - This needs major investigation. Currently, we are tagging all
-        # the forward nodes as recomputable. However, torch.utils.checkpoint
-        # provides a custom function to selectively recompute. We will have to
-        # figure out how to tag seletively.
         unique_graph_id = next(uid)
         for node in gmod.graph.nodes:
             if node.op in ("call_function", "call_method", "call_module"):
@@ -121,13 +110,47 @@ class TagActivationCheckpoint(HigherOrderOperator):
         return gmod
 
     def __call__(self, gmod, *args, **kwargs):
-        if "context_fn" in kwargs:
-            raise RuntimeError("Tagged Activation checkpointing does not support selective checkpointing yet.")
         import torch.fx.traceback as fx_traceback
         from torch.fx import Interpreter
-        gmod = self.tag_nodes(gmod)
-        # Using interpreter allows preservation of metadata through torch.compile stack.
-        with fx_traceback.preserve_node_meta():
-            return Interpreter(gmod).run(*args)
+        # TODO - This is a temporary sitaution where we have two versions of
+        # checkpointing implemetation. We will converge on one and remove the other.
+        if self.context_fn is not None or torch._functorch.config.functionalize_rng_ops:
+            # Mode 1: WrapActivationCheckpoint
+            assert kwargs.get("use_reentrant", False) is False, \
+                "use_reentrant=True is not supported under torch.compile " + \
+                "when selective checkpointing is used " + \
+                "or when `torch._functorch.config.functionalize_rng_ops` is True."
+            assert kwargs.get("preserve_rng_state", False) is False, \
+                "preserve_rng_state=True is not supported under torch.compile " + \
+                "when selective checkpointing is used " + \
+                "or when `torch._functorch.config.functionalize_rng_ops` is True. " + \
+                "If your program relies on this to have deterministic output in the checkpointed region, " + \
+                "it means the checkpointed region has ops that use random number generator (e.g. torch.dropout). " + \
+                "Please remove those random ops as they are not supported under selective checkpointing + torch.compile."
 
-tag_activation_checkpoint = TagActivationCheckpoint()
+            log.warning("""
+Detected selective checkpointing is used under torch.compile.
+Please make sure the checkpointed region does not contain:
+
+1. random ops (e.g. torch.dropout)
+2. in-place ops (e.g. torch.relu_)
+""")
+
+            kwargs["use_reentrant"] = False
+            kwargs["preserve_rng_state"] = False
+            kwargs["context_fn"] = self.context_fn
+            # We first tag all nodes as "recompute" in this graph, and then we undo the "recompute" tag
+            # for specific nodes in user-defined CachedTorchDispatchMode.
+            gmod = self.tag_nodes(gmod)
+            # Using interpreter allows preservation of metadata through torch.compile stack.
+            with fx_traceback.preserve_node_meta():
+                ret = checkpoint(Interpreter(gmod).run, *args, **kwargs)
+                return ret
+        else:
+            # Mode 2: TagActivationCheckpoint
+            gmod = self.tag_nodes(gmod)
+            # Using interpreter allows preservation of metadata through torch.compile stack.
+            with fx_traceback.preserve_node_meta():
+                return Interpreter(gmod).run(*args)
+
+handle_activation_checkpoint = HandleActivationCheckpoint()
