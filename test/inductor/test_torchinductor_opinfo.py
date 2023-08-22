@@ -387,6 +387,44 @@ def wrapper_set_seed(op, *args, **kwargs):
     return op(*args, **kwargs)
 
 
+# OpInfo that call wrapper_set_seed.
+# Ref: https://github.com/pytorch/pytorch/issues/107187
+# Since then, manual_seed calls graph-breaks. Thus, in that case, we need to allow
+# Python code.
+inductor_nopython_error = {
+    "item",
+    "cauchy",
+    "exponential",
+    "geometric",
+    "log_normal",
+    "normal",
+    "normal.in_place",
+    "normal.number_mean",
+    "uniform",
+    "nn.functional.fractional_max_pool2d",
+    "nn.functional.fractional_max_pool3d",
+    "nn.functional.rrelu",
+    "nn.functional.scaled_dot_product_attention",
+    "svd_lowrank",
+    "pca_lowrank",
+    "randn",
+    "randn_like",
+    "rand_like",
+    "randint",
+    "randint_like",
+    "empty_strided",
+    "multinomial",
+    "bernoully",
+    "nn.functional.dropout",
+    "nn.functional.dropout2d",
+    "nn.functional.dropout3d",
+    "nn.functional.alpha_dropout",
+    "nn.functional.feature_alpha_dropout",
+    "nn.functional.feature_alpha_dropout.with_train",
+    "nn.functional.feature_alpha_dropout.without_train",
+    "nn.functional.multi_head_attention_forward",
+}
+
 torch.testing._internal.common_methods_invocations.wrapper_set_seed = wrapper_set_seed
 
 # This file does a global patch to `disable_global_flags()` - which we should not invoke in non testing cases.
@@ -552,6 +590,9 @@ class TestInductorOpInfo(TestCase):
                 samples = [next(samples)]
 
         def do_nopython(fn, args, kwargs):
+            if op_name in inductor_nopython_error:
+                return False
+
             try:
                 mode = FakeTensorMode()
 
