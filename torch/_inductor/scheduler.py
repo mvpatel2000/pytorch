@@ -382,8 +382,41 @@ class BaseSchedulerNode:
         self.written = True
 
     def get_read_write_buffers_sizes(self) -> int:
+        """
+        Counting the number of bytes accessed for a kernel is
+        surprisingly tricky. In particular, there is a differentiation
+        between 'theoretical' memory accesses and practical memory
+        accesses. For example, a layernorm kernel may actually access an
+        input 3 times, but in theory, it only needs to access its input
+        once (and may be optimized to do so through say, persistent
+        reductions)
+
+        Another example is that even though a buffer is passed in, we may
+        not access the entire buffer. This may occur if we are accessing
+        a slice of the buffer. Another tricky case is for indirect
+        indexing, where the amount of bytes accessed depends on the
+        values of the input.
+
+        What this function aims to compute is the memory accesses for
+        worst-case inputs, best-case optimization. What this means is
+        that for each buffer we compute the amount of potential accesses in two ways and take the minimum.
+
+        1. Numel in ranges multiplied by number of deps the buffer has
+        2. The buffer size
+        """
         if isinstance(self, NopKernelSchedulerNode):
             return 0
+
+        if isinstance(self, SchedulerNode):
+            node_numel = sympy_product(self.get_ranges()[0]) * sympy_product(
+                self.get_ranges()[1]
+            )
+        else:
+            node_numel = int(1e9)
+        buf_accesses = collections.defaultdict(list)
+        for dep in self.read_writes.reads | self.read_writes.writes:
+            buf_accesses[dep.name].append(dep)
+
         reads = {dep.name for dep in self.read_writes.reads}
         writes = {dep.name for dep in self.read_writes.writes}
 
@@ -396,7 +429,9 @@ class BaseSchedulerNode:
             writes = writes - removed_buffers
             reads = reads - removed_buffers
         node_bytes = 0
+
         for buf in reads | writes:
+            buf_accessed_elems = sum([node_numel for dep in buf_accesses[buf]])
             if buf in V.graph.name_to_buffer:
                 buf = V.graph.name_to_buffer[buf]
             elif buf in V.graph.graph_inputs:
@@ -404,9 +439,12 @@ class BaseSchedulerNode:
             else:
                 continue
 
-            node_bytes += V.graph.sizevars.size_hint(
-                sympy_product(buf.get_size())
-            ) * get_dtype_size(buf.get_dtype())
+            buf_elems = V.graph.sizevars.size_hint(sympy_product(buf.get_size()))
+
+            node_bytes += min(buf_elems, buf_accessed_elems) * get_dtype_size(
+                buf.get_dtype()
+            )
+
         return node_bytes
 
     def get_estimated_runtime(self) -> float:

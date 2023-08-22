@@ -2,12 +2,14 @@ import functools
 import itertools
 import logging
 import operator
+from collections import defaultdict, namedtuple
 from typing import List, Optional, Union
 
 from sympy import Expr
 
 import torch
 import torch._inductor as inductor
+from torch.utils._pytree import tree_map
 
 from .. import config, ir, pattern_matcher
 
@@ -26,7 +28,6 @@ from ..pattern_matcher import (
     MULTIPLE,
     PatternMatcherPass,
     register_graph_pattern,
-    remove_extra_clones,
     stable_topological_sort,
 )
 from ..virtualized import V
@@ -47,6 +48,91 @@ pass_patterns = [
 inference_patterns = PatternMatcherPass()
 
 
+def get_storage(t):
+    return t.untyped_storage()._cdata
+
+
+def get_node_storage(node):
+    if not isinstance(node.meta["val"], torch.Tensor):
+        return None
+    if not torch._C._has_storage(node.meta["val"]):
+        return None
+    return get_storage(node.meta["val"])
+
+
+class FakeTensorUpdater:
+    def __init__(self, graph):
+        self.processed_hashes = set()
+        self.graph = graph
+
+        for node in self.graph.nodes:
+            self.processed_hashes.add(self.hash_node(node))
+
+    def hash_node(self, node):
+        return (node, node.target, node.args, node.kwargs)
+
+    def incremental_update(self):
+        """
+        Not fully featured yet. Mainly added to ensure that reinplacing pass is
+        sound.
+
+        Todo things:
+        1. We probably want to persist this across more passes.
+        """
+        return
+        processed = set()
+        existing_tensors = defaultdict(int)
+        for node in self.graph.nodes:
+            existing_tensors[get_node_storage(node)] += 1
+
+        def is_fake_tensor_same(new, old):
+            if new.shape != old.shape or new.stride() != old.stride():
+                return False
+            if get_storage(new) == get_storage(old):
+                return True
+            if (
+                existing_tensors[get_storage(old)] == 1
+                and get_storage(new) not in existing_tensors
+            ):
+                return True
+            return False
+
+        for node in self.graph.nodes:
+            if self.hash_node(node) in old_hash:
+                continue
+
+            def get_fake_tensor(x):
+                if isinstance(x, torch.fx.Node):
+                    return x.meta["val"]
+                return x
+
+            if node.op == "call_function" and isinstance(
+                node.target, torch._ops.OpOverload
+            ):
+                processing = [node]
+                while len(processing) > 0:
+                    updating_node = processing.pop()
+                    if updating_node in processed:
+                        continue
+                    if node.op != "call_function" or not isinstance(
+                        node.target, torch._ops.OpOverload
+                    ):
+                        continue
+
+                    args, kwargs = tree_map(
+                        get_fake_tensor, (updating_node.args, updating_node.kwargs)
+                    )
+                    new_fake_tensor = updating_node.target(*args, **kwargs)
+                    if is_fake_tensor_same(new_fake_tensor, updating_node.meta["val"]):
+                        continue
+                    updating_node.meta["val"] = new_fake_tensor
+                    processed.add(updating_node)
+                    for user in updating_node.users:
+                        processing.append(user)
+
+                old_hash.add(self.hash_node(updating_node))
+
+
 def post_grad_passes(gm: torch.fx.GraphModule, is_inference: bool):
     """
     Passes that run on after grad.  This is called once on the forwards
@@ -61,11 +147,12 @@ def post_grad_passes(gm: torch.fx.GraphModule, is_inference: bool):
     if is_inference and config.reordering:
         reorder_for_locality(gm.graph)
 
+    fake_tensor_updater = FakeTensorUpdater(gm.graph)
     if config.pattern_matcher:
         lazy_init()
 
         group_batch_fusion_post_grad_passes(gm.graph)
-        remove_extra_clones(gm.graph)
+        remove_noop_ops(gm.graph)
 
         for patterns in pass_patterns:
             patterns.apply(gm.graph)
@@ -73,6 +160,11 @@ def post_grad_passes(gm: torch.fx.GraphModule, is_inference: bool):
             inference_patterns.apply(gm.graph)
 
     stable_topological_sort(gm.graph)
+
+    # Keep this last, since it introduces
+    # mutation.
+    fake_tensor_updater.incremental_update()
+    reinplace_scatters(gm.graph)
     gm.recompile()
     gm.graph.lint()
 
@@ -372,7 +464,7 @@ _cat_1 = CallFunction(aten.cat, Arg(), 1, _users=2)
             _cat_1,
             CallFunction(
                 aten.slice,
-                CallFunction(aten.slice, _cat_1, 0, 0, 9223372036854775807),
+                _cat_1,
                 1,
                 0,
                 KeywordArg("size"),
@@ -482,6 +574,125 @@ def is_valid_splitwithsizes_cat(match):
         return False
 
     return True
+
+
+def same_layout(node1: torch.fx.Node, node2: torch.fx.Node):
+    """True if two nodes have the same size/strides"""
+    val1 = node1.meta.get("val")
+    val2 = node2.meta.get("val")
+    return (
+        val1 is not None
+        and val2 is not None
+        and val1.size() == val2.size()
+        and val1.stride() == val2.stride()
+    )
+
+
+def remove_noop_ops(graph: torch.fx.Graph):
+    def true(*args, **kwargs):
+        return True
+
+    def slice_scatter_cond(self, src, dim=0, start=None, end=None, step=1):
+        if start is None or end is None:
+            return False
+        if start == 0 and end >= 2**63 - 1 and step == 1:
+            return True
+        return False
+
+    def slice_cond(self, dim=0, start=None, end=None, step=1):
+        if start is None or end is None:
+            return False
+        if start == 0 and end >= 2**63 - 1 and step == 1:
+            return True
+        return False
+
+    input_storages = set()
+    output_storages = set()
+    for node in graph.nodes:
+        if node.op == "placeholder":
+            input_storages.add(get_node_storage(node))
+        else:
+            break
+
+    for out in tuple(graph.nodes)[-1].args[0]:
+        if isinstance(out, torch.fx.Node):
+            output_storages.add(get_node_storage(out))
+
+    noop_conditions = {
+        aten.slice.Tensor: (0, slice_cond),
+        aten.clone.default: (0, true),
+        aten.slice_scatter.default: (1, slice_scatter_cond),
+    }
+
+    for node in graph.nodes:
+        if node.target in noop_conditions:
+            cloned_arg_index, cond = noop_conditions[node.target]
+            src = node.args[cloned_arg_index]
+            if (
+                get_node_storage(node) in output_storages
+                and get_node_storage(src) in input_storages
+            ):
+                continue
+            if same_layout(node, src) and cond(*node.args, **node.kwargs):
+                node.replace_all_uses_with(src)
+                graph.erase_node(node)
+
+
+def reinplace_scatters(graph):
+    """
+    Reinplaces scatter operations in easy cases where the node being mutated
+    is only used by the scatter (users == 1), and the node being mutated
+    shares storage with no other nodes.
+
+    Also handles input mutations when there is a corresponding copy node.
+    """
+
+    copy_nodes = {}
+    mutated_inputs = set()
+    storage_to_nodes = defaultdict(list)
+    for node in reversed(graph.nodes):
+        if isinstance(node.meta["val"], torch.Tensor):
+            storage_to_nodes[get_node_storage(node)].append(node)
+        if node.target == aten.copy_.default:
+            copy_nodes[(node.args[0], node.args[1])] = node
+            mutated_inputs.add(node.args[0])
+        elif node.op == "output":
+            pass
+
+    InplaceableOp = namedtuple("InplaceableOp", ["inplace_op", "mutated_arg"])
+
+    inplaceable_ops = {
+        aten.index_put.default: InplaceableOp(aten.index_put_.default, 0),
+    }
+    for node in graph.nodes:
+        if inplaceable_op := inplaceable_ops.get(node.target, False):
+            mutated_arg = node.args[inplaceable_op.mutated_arg]
+            if get_node_storage(mutated_arg) is None:
+                continue
+            shared_view_nodes = storage_to_nodes[get_node_storage(mutated_arg)]
+            if mutated_arg.op == "placeholder":
+                if not (copy_node := copy_nodes.get((mutated_arg, node), False)):
+                    continue
+
+                if (
+                    len(shared_view_nodes) > 2
+                ):  # Arg aliases another node other than copy_
+                    continue
+
+                # Check for any uses other than current node and copy_ epilogue
+                if len(mutated_arg.users) > 2:
+                    continue
+
+                graph.erase_node(copy_node)
+                node.target = inplaceable_op.inplace_op
+            else:
+                # NB: This condition could be relaxed if none of the aliases
+                # are used after this mutation op. But that's trickier.
+                if len(shared_view_nodes) > 1:  # Arg aliases another node
+                    continue
+                if len(mutated_arg.users) > 1:  # Arg used somewhere else
+                    continue
+                node.target = inplaceable_op.inplace_op
 
 
 @register_lowering_pattern(
