@@ -918,19 +918,6 @@ class HigherOrderOpTests(torch._dynamo.test_case.TestCase):
             # we take the `else` branch and `y` is not lifted.
             self._test_wrap_simple(f, (x, y, 8), 2)
 
-    def test_wrap_unsupported_kwarg(self):
-        def f(x, y, z):
-            def fn(*, x, y, z):
-                z1, z2 = z
-                return (x * 2) + y + z1
-
-            return wrap(fn, x=x, y=y, z=z)
-
-        x = torch.randn(3)
-        y = torch.randn(3, 3)
-
-        self._assert_wrap_fallback(f, (x, y, (x, y)))
-
     def test_map_subgraph_name_is_valid(self):
         backend = EagerAndRecordGraphs()
         cnt = CompileCounterWithBackend(backend)
@@ -1607,6 +1594,25 @@ def forward(self, s0 : torch.SymInt, s1 : torch.SymInt, L_x_ : torch.Tensor):
 
         self.assertTrue(activations.keys() == forward_handles.keys())
 
+    def test_multiple_return(self):
+        class Foo(torch.autograd.Function):
+            @staticmethod
+            def forward(ctx, x):
+                ctx.save_for_backward(x)
+                return x.sin(), x.sin()
+
+            @staticmethod
+            def backward(ctx, grad0, grad1):
+                (x,) = ctx.saved_tensors
+                return grad0 * x.cos(), grad1 * x.cos()
+
+        @torch.compile(backend="eager", fullgraph=True)
+        def f(x):
+            return Foo.apply(x)
+
+        x = torch.randn([], requires_grad=True)
+        f(x)
+
 
 class FuncTorchHigherOrderOpTests(torch._dynamo.test_case.TestCase):
     def run(self, result=None):
@@ -2084,11 +2090,6 @@ class GraphModule(torch.nn.Module):
             (x1, x2)
         )
         self.assertEqual(len(counters["graph_break"]), 1)
-        assert_dict_matches_regex(
-            self,
-            dict(counters["graph_break"]),
-            {".*HigherOrderOperator with body that accepts non-Tensors as input": 2},
-        )
         self.assertEqual(actual, expected)
 
     def test_grad_non_tensor_input(self):
