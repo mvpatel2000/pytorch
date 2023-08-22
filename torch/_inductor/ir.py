@@ -2000,7 +2000,11 @@ class Layout(IRNode):
         ), f"size={size}, stride={stride}"
         self.device = device
         self.dtype = dtype
-        assert all(isinstance(s, (Expr, int)) for s in size)
+        assert all(
+            isinstance(s, (Expr, int))
+            or V.graph.sizevars.shape_env.is_unbacked_symint(s)
+            for s in size
+        )
         self.size = size
         self._stride = stride
         self.offset = offset
@@ -5566,4 +5570,102 @@ class ReduceScatterTensorCoalesced(OutOfPlaceCollectiveKernel):
             f"op=fun_col_impl._str_to_reduce_op('{str(self.reduce_op)}'), "
             f"group={output_name}_pg, "
             "async_op=True)"
+        )
+
+
+"""
+NOTE: `all_to_all_single` is implemented differently from other collectives
+because its output shape is data-dependent on input `output_split_sizes`.
+Instead of letting Inductor manage allocation of output buffer that has
+data-dependent dim size which is difficult to do, we resort to using
+`ExternKernelAlloc` and letting the underlying `fun_col_impl._all_to_all_single`
+kernel manage the output buffer allocation.
+"""
+
+
+class AllToAllSingle(ExternKernelAlloc):
+    def __init__(
+        self,
+        layout,
+        inputs,
+        constant_args,
+        inputs_allow_none,
+    ):
+        super().__init__(layout, inputs, constant_args)
+        self.inputs = inputs
+        self.inputs_allow_none = inputs_allow_none
+
+    @classmethod
+    def create(
+        cls,
+        x: "TensorBox",
+        output_split_sizes: Optional["TensorBox"],
+        input_split_sizes: Optional["TensorBox"],
+        tag: str,
+        ranks: List[int],
+        group_size: int,
+    ):
+        x_realized = cls.realize_input(x)
+        inputs_allow_none = []
+        output_split_sizes_realized = None
+        if output_split_sizes is not None:
+            output_split_sizes_realized = cls.realize_input(output_split_sizes)
+            # NCCL/GLOO alltoall_base also assumes output_split_sizes to be int64,
+            # so hardcoding int64 here should be okay.
+            V.graph.name_to_coerced_dtype[
+                output_split_sizes_realized.data.name
+            ] = torch.int64
+        input_split_sizes_realized = None
+        if input_split_sizes is not None:
+            input_split_sizes_realized = cls.realize_input(input_split_sizes)
+            # NCCL/GLOO alltoall_base also assumes input_split_sizes to be int64,
+            # so hardcoding int64 here should be okay.
+            V.graph.name_to_coerced_dtype[
+                input_split_sizes_realized.data.name
+            ] = torch.int64
+        inputs_allow_none = [
+            x_realized,
+            output_split_sizes_realized,
+            input_split_sizes_realized,
+        ]
+        inputs = [inp for inp in inputs_allow_none if inp is not None]
+
+        return AllToAllSingle(
+            layout=inputs[0].get_layout(),
+            inputs=inputs,
+            constant_args=[tag, ranks, group_size],
+            inputs_allow_none=inputs_allow_none,
+        )
+
+        return cls.create_output_nodes(packed, outputs)[0]
+
+    def codegen(self, wrapper):
+        wrapper.add_import_once("import torch.distributed as dist")
+        wrapper.add_import_once("import torch.distributed.distributed_c10d as c10d")
+        wrapper.add_import_once(
+            "import torch.distributed._functional_collectives_impl as fun_col_impl"
+        )
+        # extract references to our args in string form for codegen output
+        input_names = [t.codegen_reference() for t in self.inputs]
+        output_name = self.get_name()
+
+        wrapper.writeline(f"{output_name}_inputs = [{','.join(input_names)}]")
+
+        input_strs = [f"{output_name}_inputs[0]"]
+        for i in range(1, len(self.inputs_allow_none)):
+            inp = self.inputs_allow_none[i]
+            if inp is None:
+                input_strs.append("None")
+            else:
+                input_strs.append(f"{output_name}_inputs[{self.inputs.index(inp)}]")
+
+        tag, ranks, group_size = self.constant_args
+        wrapper.writeline(
+            f"{output_name} = fun_col_impl._all_to_all_single("
+            f"input={input_strs[0]}, "
+            f"output_split_sizes={input_strs[1]}, "
+            f"input_split_sizes={input_strs[2]}, "
+            f"tag='{tag}', "
+            f"ranks={ranks}, "
+            f"group_size={group_size})",
         )
