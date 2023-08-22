@@ -1449,6 +1449,7 @@ class TorchPatcher:
         # Note: we don't support sparsity, data-dependent control, or tracing through backwards
         excluded_opts = {torch.optim.SparseAdam, torch.optim.RAdam, torch.optim.LBFGS}
         for opt in optimizers:
+            opt.register_load_state_dict_pre_hook = disable(opt.register_load_state_dict_pre_hook)
             if opt in excluded_opts:
                 opt.step = disable(opt.step)
 
